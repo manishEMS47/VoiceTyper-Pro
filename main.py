@@ -14,43 +14,148 @@ from PIL import Image
 import asyncio
 import pystray
 import json
+import requests
 from deepgram.errors import DeepgramSetupError
 
 # Set theme and color scheme
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
+
+# ---------------------------------------------------------------------------
+# Speech-to-text providers
+#
+# Every provider exposes the same contract -- transcribe(audio_file) -> str --
+# so the rest of the app (recording, typing, logging) never has to know which
+# backend is active. Add a new provider by subclassing STTProvider and
+# registering it in VoiceTyperApp.build_provider().
+# ---------------------------------------------------------------------------
+class STTProvider:
+    """Common interface for all transcription backends."""
+    name = "base"
+
+    def transcribe(self, audio_file):
+        """Transcribe a WAV file on disk and return the plain transcript text."""
+        raise NotImplementedError
+
+
+class DeepgramProvider(STTProvider):
+    """Deepgram pre-recorded (batch) transcription via the v2 SDK."""
+    name = "deepgram"
+
+    def __init__(self, api_key):
+        # Deepgram() validates the key format synchronously and raises
+        # DeepgramSetupError if it is malformed.
+        self.client = Deepgram(api_key)
+
+    def transcribe(self, audio_file):
+        return asyncio.run(self._transcribe(audio_file))
+
+    async def _transcribe(self, audio_file):
+        with open(audio_file, 'rb') as audio:
+            source = {'buffer': audio, 'mimetype': 'audio/wav'}
+            options = {
+                'punctuate': True,
+                'language': 'en',
+                'model': 'general',
+            }
+            response = await self.client.transcription.prerecorded(source, options)
+            return response['results']['channels'][0]['alternatives'][0]['transcript']
+
+
+class SixtyDBProvider(STTProvider):
+    """60db speech-to-text via the REST API (https://api.60db.ai/stt)."""
+    name = "60db"
+    STT_URL = "https://api.60db.ai/stt"
+
+    def __init__(self, api_key):
+        if not api_key or not api_key.strip():
+            # Mirror Deepgram's "bad key at setup" behaviour so the UI can
+            # surface the API-key dialog. The key itself is only verified
+            # against the server on the first transcription request.
+            raise DeepgramSetupError("Missing 60db API key")
+        self.api_key = api_key.strip()
+
+    def transcribe(self, audio_file):
+        headers = {'Authorization': f'Bearer {self.api_key}'}
+        with open(audio_file, 'rb') as audio:
+            files = {'file': (os.path.basename(audio_file), audio, 'audio/wav')}
+            data = {'language': 'en'}
+            response = requests.post(
+                self.STT_URL,
+                headers=headers,
+                files=files,
+                data=data,
+                timeout=60,
+            )
+        response.raise_for_status()
+        return response.json().get('text', '')
+
 class SettingsDialog:
-    def __init__(self, parent):
+    PROVIDERS = ["60db", "deepgram"]
+
+    def __init__(self, parent, app=None):
+        self.app = app
         self.dialog = ctk.CTkToplevel(parent)
         self.dialog.title("Settings")
-        self.dialog.geometry("400x200")
+        self.dialog.geometry("400x320")
         self.dialog.transient(parent)
         self.dialog.resizable(False, False)
-        
-        # Load current API key
-        with open('settings.json', 'r') as f:
-            self.settings = json.load(f)
-        
-        # API Key input
-        self.api_frame = ctk.CTkFrame(self.dialog)
-        self.api_frame.pack(fill="x", padx=20, pady=20)
-        
-        self.api_label = ctk.CTkLabel(
-            self.api_frame, 
-            text="Deepgram API Key:",
+
+        # Load current settings
+        try:
+            with open('settings.json', 'r') as f:
+                self.settings = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            self.settings = {}
+
+        # Per-provider keys (migrate the legacy single api_key onto Deepgram)
+        self.keys = {
+            "deepgram": self.settings.get('deepgram_api_key', self.settings.get('api_key', '')),
+            "60db": self.settings.get('60db_api_key', ''),
+        }
+        self.current_provider = self.settings.get('provider', '60db')
+        if self.current_provider not in self.PROVIDERS:
+            self.current_provider = '60db'
+
+        self.frame = ctk.CTkFrame(self.dialog)
+        self.frame.pack(fill="x", padx=20, pady=20)
+
+        # Provider selector
+        self.provider_label = ctk.CTkLabel(
+            self.frame,
+            text="Transcription Provider:",
             font=ctk.CTkFont(size=14)
         )
-        self.api_label.pack(anchor="w", pady=5)
-        
+        self.provider_label.pack(anchor="w", pady=(5, 0))
+
+        self.provider_var = ctk.StringVar(value=self.current_provider)
+        self.provider_menu = ctk.CTkOptionMenu(
+            self.frame,
+            values=self.PROVIDERS,
+            variable=self.provider_var,
+            command=self.on_provider_change,
+            width=300
+        )
+        self.provider_menu.pack(pady=5)
+
+        # API key input (contents follow the selected provider)
+        self.api_label = ctk.CTkLabel(
+            self.frame,
+            text="API Key:",
+            font=ctk.CTkFont(size=14)
+        )
+        self.api_label.pack(anchor="w", pady=(10, 0))
+
         self.api_entry = ctk.CTkEntry(
-            self.api_frame,
+            self.frame,
             width=300,
             font=ctk.CTkFont(size=14)
         )
         self.api_entry.pack(pady=5)
-        self.api_entry.insert(0, self.settings.get('api_key', ''))
-        
+        self.api_entry.insert(0, self.keys.get(self.current_provider, ''))
+        self._update_key_label()
+
         # Save button
         self.save_btn = ctk.CTkButton(
             self.dialog,
@@ -59,12 +164,30 @@ class SettingsDialog:
             width=100
         )
         self.save_btn.pack(pady=20)
-        
+
+    def _update_key_label(self):
+        self.api_label.configure(text=f"{self.current_provider} API Key:")
+
+    def on_provider_change(self, value):
+        # Stash whatever is currently typed before swapping the field contents.
+        self.keys[self.current_provider] = self.api_entry.get()
+        self.current_provider = value
+        self.api_entry.delete(0, 'end')
+        self.api_entry.insert(0, self.keys.get(value, ''))
+        self._update_key_label()
+
     def save_settings(self):
-        self.settings['api_key'] = self.api_entry.get()
+        self.keys[self.current_provider] = self.api_entry.get()
+        self.settings['provider'] = self.current_provider
+        self.settings['deepgram_api_key'] = self.keys['deepgram']
+        self.settings['60db_api_key'] = self.keys['60db']
+        # Keep the legacy field in sync for backward compatibility.
+        self.settings['api_key'] = self.keys['deepgram']
         with open('settings.json', 'w') as f:
-            json.dump(self.settings, f)
+            json.dump(self.settings, f, indent=2)
         self.dialog.destroy()
+        if self.app is not None:
+            self.app.reload_provider()
 
 class VoiceTyperApp:
     def __init__(self):
@@ -79,56 +202,58 @@ class VoiceTyperApp:
         self.stop_recording = False
         self.pykeyboard = keyboard.Controller()
         self.recording_animation_active = False
-        
-        # Try to load settings and initialize Deepgram
-        try:
-            self.load_settings()
-        except DeepgramSetupError:
-            # Show settings dialog immediately if API key is invalid
-            self.setup_ui()  # Setup UI first
-            self.show_api_key_error()
-        except Exception as e:
-            self.setup_ui()
-            self.show_error(f"Error: {str(e)}")
-            
+
+        # Build the UI before anything that might report status/errors into it.
+        self.setup_ui()
+
         # Initialize system tray
         self.setup_system_tray()
-        
+
         # Track if log section is expanded
         self.log_expanded = False  # Start with log collapsed
-        
+
         # Global keyboard listener
         self.keyboard_listener = keyboard.Listener(
             on_press=self.on_key_press,
             on_release=self.on_key_release
         )
         self.keyboard_listener.start()
-        
-        self.setup_ui()
+
+        # Load settings and initialize the selected transcription provider.
+        try:
+            self.load_settings()
+        except DeepgramSetupError:
+            # Show the API-key dialog immediately if the key is missing/invalid.
+            self.show_api_key_error()
+        except Exception as e:
+            self.show_error(f"Error: {str(e)}")
+
         self.start_transcription_thread()
         
     def show_api_key_error(self):
+        provider_name = self.settings.get('provider', '60db')
+
         error_dialog = ctk.CTkToplevel(self.root)
         error_dialog.title("API Key Error")
         error_dialog.geometry("400x200")
         error_dialog.transient(self.root)
         error_dialog.resizable(False, False)
-        
+
         # Center the dialog
         error_dialog.geometry("+%d+%d" % (
             self.root.winfo_x() + (self.root.winfo_width() - 400) // 2,
             self.root.winfo_y() + (self.root.winfo_height() - 200) // 2
         ))
-        
+
         # Error message
         message = ctk.CTkLabel(
             error_dialog,
-            text="Invalid Deepgram API Key detected.\nPlease enter a valid API key to continue.",
+            text=f"Missing or invalid {provider_name} API Key.\nPlease enter a valid API key to continue.",
             font=ctk.CTkFont(size=14),
             wraplength=350
         )
         message.pack(pady=20)
-        
+
         # API Key input
         api_entry = ctk.CTkEntry(
             error_dialog,
@@ -136,17 +261,21 @@ class VoiceTyperApp:
             font=ctk.CTkFont(size=14)
         )
         api_entry.pack(pady=10)
-        api_entry.insert(0, self.settings.get('api_key', ''))
-        
+        api_entry.insert(0, self.get_key_for(provider_name))
+
         def save_and_retry():
             new_key = api_entry.get()
             try:
-                # Try to initialize Deepgram with new key
-                self.deepgram = Deepgram(new_key)
-                # If successful, save the new key
-                self.settings['api_key'] = new_key
+                # Try to initialize the active provider with the new key.
+                self.provider = self.build_provider(provider_name, new_key)
+                # If successful, persist the key for that provider.
+                if provider_name == 'deepgram':
+                    self.settings['deepgram_api_key'] = new_key
+                    self.settings['api_key'] = new_key
+                else:
+                    self.settings[f'{provider_name}_api_key'] = new_key
                 with open('settings.json', 'w') as f:
-                    json.dump(self.settings, f)
+                    json.dump(self.settings, f, indent=2)
                 error_dialog.destroy()
                 self.status_label.configure(text="API Key updated successfully!")
             except DeepgramSetupError:
@@ -171,15 +300,48 @@ class VoiceTyperApp:
         try:
             with open('settings.json', 'r') as f:
                 self.settings = json.load(f)
-        except FileNotFoundError:
-            self.settings = {'api_key': ''}
-            
+        except (FileNotFoundError, json.JSONDecodeError):
+            self.settings = {}
+
+        # Migrate the legacy single-key format onto Deepgram.
+        if 'api_key' in self.settings and 'deepgram_api_key' not in self.settings:
+            self.settings['deepgram_api_key'] = self.settings['api_key']
+        self.settings.setdefault('provider', '60db')
+
+        provider_name = self.settings['provider']
         try:
-            self.deepgram = Deepgram(self.settings['api_key'])
+            self.provider = self.build_provider(provider_name, self.get_key_for(provider_name))
         except DeepgramSetupError:
             raise
         except Exception as e:
-            raise Exception(f"Failed to initialize Deepgram: {str(e)}")
+            raise Exception(f"Failed to initialize {provider_name}: {str(e)}")
+
+    def get_key_for(self, provider_name):
+        """Return the stored API key for a provider from self.settings."""
+        if provider_name == 'deepgram':
+            return self.settings.get('deepgram_api_key', self.settings.get('api_key', ''))
+        return self.settings.get(f'{provider_name}_api_key', '')
+
+    def build_provider(self, provider_name, api_key):
+        """Construct an STTProvider instance for the given backend name."""
+        if provider_name == 'deepgram':
+            return DeepgramProvider(api_key)
+        elif provider_name == '60db':
+            return SixtyDBProvider(api_key)
+        raise ValueError(f"Unknown provider: {provider_name}")
+
+    def reload_provider(self):
+        """Rebuild the active provider after settings change (called from the dialog)."""
+        try:
+            self.load_settings()
+            self.status_label.configure(
+                text=f"Ready to record... ({self.settings['provider']})",
+                text_color=("gray10", "gray90")
+            )
+        except DeepgramSetupError:
+            self.show_api_key_error()
+        except Exception as e:
+            self.show_error(f"Error: {str(e)}")
         
     def setup_system_tray(self):
         # Create system tray icon
@@ -301,7 +463,7 @@ class VoiceTyperApp:
                 self.record_button.configure(fg_color="#c93434")
     
     def toggle_recording(self):
-        if not hasattr(self, 'deepgram'):
+        if not hasattr(self, 'provider'):
             self.show_api_key_error()
             return
             
@@ -379,17 +541,6 @@ class VoiceTyperApp:
         
         self.status_label.configure(text="Processing transcription...")
         
-    async def transcribe_audio(self, audio_file):
-        with open(audio_file, 'rb') as audio:
-            source = {'buffer': audio, 'mimetype': 'audio/wav'}
-            options = {
-                'punctuate': True,
-                'language': 'en',
-                'model': 'general',
-            }
-            response = await self.deepgram.transcription.prerecorded(source, options)
-            return response['results']['channels'][0]['alternatives'][0]['transcript']
-            
     def start_transcription_thread(self):
         threading.Thread(target=self.transcribe_speech).start()
         
@@ -402,7 +553,7 @@ class VoiceTyperApp:
                 
             audio_file = f"test{i}.wav"
             try:
-                transcript = asyncio.run(self.transcribe_audio(audio_file))
+                transcript = self.provider.transcribe(audio_file)
                 
                 # Update GUI
                 self.transcription_text.insert('1.0', f"{datetime.now().strftime('%H:%M:%S')}: {transcript}\n\n")
@@ -496,7 +647,7 @@ class VoiceTyperApp:
         self.root.quit()
 
     def open_settings(self):
-        SettingsDialog(self.root)
+        SettingsDialog(self.root, self)
 
     def run(self):
         self.root.mainloop()
